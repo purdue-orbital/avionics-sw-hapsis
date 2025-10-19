@@ -1,6 +1,7 @@
 #![no_std]
 #![no_main]
 
+use chrono::format;
 use defmt::*;
 use embassy_executor::{Spawner, task};
 use embassy_stm32::gpio::{Level, Output, Speed};
@@ -17,7 +18,7 @@ use {defmt_rtt as _, panic_probe as _};
 use embassy_stm32::spi::{BitOrder, Spi};
 use embassy_stm32::time::Hertz;
 use {defmt_rtt as _, panic_probe as _};
-use embedded_sdmmc::{sdcard::AcquireOpts, File, Mode, SdCard, TimeSource, Timestamp, VolumeIdx, VolumeManager};
+use embedded_sdmmc_async::{sdcard::{self, AcquireOpts}, File, Mode, SdCard, TimeSource, Timestamp, Volume, VolumeIdx, VolumeManager};
 use embedded_hal_bus::spi::ExclusiveDevice;
 
 use libm::powf;
@@ -47,11 +48,15 @@ impl TimeSource for DummyTimesource {
 }
 
 const FILE_TO_CREATE: &str = "CREATE.TXT";
-const BUFFER_MAX_LENGTH: u16 = 256;
+const BUFFER_MAX_LENGTH: usize = 256;
+
+const MAX_DIRS: usize = 4;
+const MAX_FILES: usize = 4;
+const MAX_VOLUMES: usize = 1;
 
 #[embassy_executor::main]
 async fn main(_spawner: Spawner) {
-    let p = embassy_stm32::init(Default::default());
+    let p: embassy_stm32::Peripherals = embassy_stm32::init(Default::default());
     info!("Hello World!");
 
     let mut spi_config = embassy_stm32::spi::Config::default();
@@ -77,24 +82,24 @@ async fn main(_spawner: Spawner) {
     let spi_cs = Output::new(p.PA3, Level::High, Speed::Low);
     let spi_dev = ExclusiveDevice::new(spi, spi_cs, Delay).unwrap();
 
-    let sd_card_options = AcquireOpts{use_crc: true, acquire_retries: 1};
+    let sd_card_options = AcquireOpts{use_crc: true, acquire_retries: 5};
 
     let sd_card = SdCard::new_with_options(spi_dev, Delay, sd_card_options);
 
-    // info!("Init SD card controller and retrieve card size...");
-    // let sd_size = sd_card.num_bytes();
+    info!("Init SD card controller and retrieve card size...");
+    let sd_size = sd_card.num_bytes().await;
 
-    // match(sd_size) {
-    //     Ok(size) => {
-    //         info!("SD Card Size: {}", size);
-    //     },
-    //     Err(e) => {
-    //         info!("Error: {:?}", defmt::Debug2Format(&e));
-    //     }
-    // }
+    match(sd_size) {
+        Ok(size) => {
+            info!("SD Card Size: {}", size);
+        },
+        Err(e) => {
+            info!("Error: {:?}", defmt::Debug2Format(&e));
+        }
+    }
 
     let volume_mgr: VolumeManager<SdCard<ExclusiveDevice<Spi<'_, embassy_stm32::mode::Async>, Output<'_>, Delay>, Delay>, DummyTimesource> = VolumeManager::new(sd_card, DummyTimesource::default());
-    // let volume = volume_mgr.open_volume(VolumeIdx(0)).unwrap();
+    // let mut volume: embedded_sdmmc_async::Volume<'_, SdCard<ExclusiveDevice<Spi<'_, embassy_stm32::mode::Async>, Output<'_>, Delay>, Delay>, DummyTimesource, 4, 4, 1> = volume_mgr.open_volume(VolumeIdx(0)).await.unwrap();
 
     // let root_dir = volume.open_root_dir().unwrap();
     // info!("\nCreating file {}...", FILE_TO_CREATE);
@@ -113,7 +118,6 @@ async fn main(_spawner: Spawner) {
     // info!("Diff: {}", end_timestamp - start_timestamp);
 
     // f.close().unwrap();
-
     let led = Output::new(p.PB7, Level::High, Speed::Low);
 
     _spawner.spawn(control_task(led)).unwrap();
@@ -247,18 +251,31 @@ async fn imu_task() {
 
 // receives sensor data, adds to byte buffer. Once buffer reaches 256 bytes writes data to sd card
 #[task]
-async fn log_task(mut vol_manager: VolumeManager<SdCard<ExclusiveDevice<Spi<'static, embassy_stm32::mode::Async>, Output<'static>, Delay>, Delay>, DummyTimesource>) {
+async fn log_task(volume_mgr: VolumeManager<SdCard<ExclusiveDevice<Spi<'static, embassy_stm32::mode::Async>, Output<'static>, Delay>, Delay>, DummyTimesource>) {
     info!("Entered logging task");
 
-    let mut buf_index: u16 = 0;
+    let mut buf_index: usize = 0;
+    let mut buf: [u8; BUFFER_MAX_LENGTH] = [0u8; BUFFER_MAX_LENGTH];
 
     loop {
         // check for baro data
         while let Ok(data) = BARO_DATA_CHANNEL.try_receive() {
             info!("received baro data: p: {}, t: {}, ts: {}", data.pressure, data.temperature, data.time_stamp);
-
-            // add to byte buffer
-            buf_index += 12;
+            let pressure: [u8; 4] = data.pressure.to_le_bytes();
+            let temperature: [u8; 4] = data.temperature.to_le_bytes();
+            let timestamp: [u8; 4] = data.time_stamp.to_le_bytes();
+            for byte in pressure {
+                buf[buf_index] = byte;
+                buf_index += 1;
+            }
+            for byte in temperature {
+                buf[buf_index] = byte;
+                buf_index += 1;
+            }
+            for byte in timestamp {
+                buf[buf_index] = byte;
+                buf_index += 1;
+            }
         }
         
         while let Ok(data) = IMU_DATA_CHANNEL.try_receive() {
@@ -267,52 +284,125 @@ async fn log_task(mut vol_manager: VolumeManager<SdCard<ExclusiveDevice<Spi<'sta
                 data.gyro[0], data.gyro[1], data.gyro[2],
                 data.mag[0], data.mag[1], data.mag[2],
                 data.time_stamp);
+            let imu_line = heapless::format!(100; "received imu data: a: ({}, {}, {}), g: ({}, {}, {}), m: ({}, {}, {}), ts: {}\r\n", 
+                data.acceleration[0], data.acceleration[1], data.acceleration[2],
+                data.gyro[0], data.gyro[1], data.gyro[2],
+                data.mag[0], data.mag[1], data.mag[2],
+                data.time_stamp).unwrap();
 
-                // add to byte buffer
-                buf_index += 40;
+
+            write_to_sd_card(&volume_mgr, imu_line.as_str()).await;
+
+            for i in 0..3 {
+                for byte in data.acceleration[i].to_le_bytes() {
+                    buf[buf_index] = byte;
+                    buf_index += 1;
+                }
+            }
+
+            for i in 0..3 {
+                for byte in data.gyro[i].to_le_bytes() {
+                    buf[buf_index] = byte;
+                    buf_index += 1;
+                }
+            }
+
+            for i in 0..3 {
+                for byte in data.mag[i].to_le_bytes() {
+                    buf[buf_index] = byte;
+                    buf_index += 1;
+                }
+            }
+
+            for byte in data.time_stamp.to_le_bytes() {
+                
+                buf[buf_index] = byte;
+                buf_index += 1;
+            }
         }
 
-        // if byte buffer has 256 bytes, send to sd card
-        if buf_index >= BUFFER_MAX_LENGTH {
-            info!("buffer full, writing to sd card");
-            write_to_sd_card(& mut vol_manager);
-            buf_index -= BUFFER_MAX_LENGTH;
-        }
+        // // if byte buffer has 256 bytes, send to sd card
+        // if buf_index >= BUFFER_MAX_LENGTH {
+        // info!("buffer full, writing to sd card");
+        // write_to_sd_card(& volume_mgr, buf).await;
+        buf_index = 0;
+        // }
     
         // wait state to let other tasks run
         Timer::after(Duration::from_millis(50)).await;
 
     }
+}
 
-    fn write_to_sd_card(volume_mgr: & mut VolumeManager<SdCard<ExclusiveDevice<Spi<'static, embassy_stm32::mode::Async>, Output<'static>, Delay>, Delay>, DummyTimesource>) {
-         let volume = volume_mgr.open_volume(VolumeIdx(0)).unwrap();
+async fn write_to_sd_card(volume_mgr: &  VolumeManager<SdCard<ExclusiveDevice<Spi<'_, embassy_stm32::mode::Async>, Output<'_>, Delay>, Delay>, DummyTimesource>, buf: &str) {
+    let volume_future = volume_mgr.open_volume(VolumeIdx(0)).await;
 
-        let root_dir = volume.open_root_dir().unwrap();
-        info!("\nCreating file {}...", FILE_TO_CREATE);
+    match volume_future {
+        Ok(volume) => {
+            let root_dir = volume.open_root_dir().await.unwrap();
+            info!("\nCreating or Appending file {}...", FILE_TO_CREATE);
 
-        // if (!root_dir.find_directory_entry(FILE_TO_CREATE).is_err()) {
-        //         info!("File with name {} already exists!", FILE_TO_CREATE);
-        //         root_dir.delete_file_in_dir(FILE_TO_CREATE).unwrap();
-        //         info!("Deleting File {}", FILE_TO_CREATE);
-        //     }
-        let f: File<'_, SdCard<ExclusiveDevice<Spi<'_, embassy_stm32::mode::Async>, Output<'_>, Delay>, Delay>, DummyTimesource, 4, 4, 1> = root_dir.open_file_in_dir(FILE_TO_CREATE, Mode::ReadWriteCreateOrAppend).unwrap();
-        let mut start_timestamp: u32 = Instant::now().as_micros() as u32;
-        match f.write(&[0u8; 8192]) {
-            Ok(_) => {
-                let mut end_timestamp: u32 = Instant::now().as_micros() as u32;
-                info!("Diff: {}", end_timestamp - start_timestamp);
-            },
+            // if (!root_dir.find_directory_entry(FILE_TO_CREATE).is_err()) {
+            //         info!("File with name {} already exists!", FILE_TO_CREATE);
+            //         root_dir.delete_file_in_dir(FILE_TO_CREATE).unwrap();
+            //         info!("Deleting File {}", FILE_TO_CREATE);
+            //     }
+            let f: File<'_, SdCard<ExclusiveDevice<Spi<'_, embassy_stm32::mode::Async>, Output<'_>, Delay>, Delay>, DummyTimesource, 4, 4, 1> = root_dir.open_file_in_dir(FILE_TO_CREATE, Mode::ReadWriteCreateOrAppend).await.unwrap();
+            let mut start_timestamp: u32 = Instant::now().as_micros() as u32;
+            match f.write(buf.as_bytes()).await {
+                Ok(_) => {
+                    let mut end_timestamp: u32 = Instant::now().as_micros() as u32;
+                    info!("Diff: {}", end_timestamp - start_timestamp);
+                },
 
-            Err(e) => {
-                let mut end_timestamp: u32 = Instant::now().as_micros() as u32;
-                error!("Diff: {}", end_timestamp - start_timestamp);
-                
+                Err(e) => {
+                    let mut end_timestamp: u32 = Instant::now().as_micros() as u32;
+                    error!("Diff: {}", end_timestamp - start_timestamp);
+                    
+                }
+            }
+            
+            f.close().await.unwrap();
+            root_dir.close().unwrap();
+            volume.close().await.unwrap();
+        },
+
+        Err(e) => {
+            error!("{}", defmt::Debug2Format(&e));
+            match (&e) {
+                embedded_sdmmc_async::Error::TooManyOpenVolumes=>{}
+                embedded_sdmmc_async::Error::DeviceError(_) => {},
+                embedded_sdmmc_async::Error::FormatError(_) => {},
+                embedded_sdmmc_async::Error::NoSuchVolume => {},
+                embedded_sdmmc_async::Error::FilenameError(filename_error) => {},
+                embedded_sdmmc_async::Error::TooManyOpenDirs => {},
+                embedded_sdmmc_async::Error::TooManyOpenFiles => {},
+                embedded_sdmmc_async::Error::BadHandle => {},
+                embedded_sdmmc_async::Error::NotFound => {},
+                embedded_sdmmc_async::Error::FileAlreadyOpen => {},
+                embedded_sdmmc_async::Error::DirAlreadyOpen => {},
+                embedded_sdmmc_async::Error::OpenedDirAsFile => {},
+                embedded_sdmmc_async::Error::OpenedFileAsDir => {},
+                embedded_sdmmc_async::Error::DeleteDirAsFile => {},
+                embedded_sdmmc_async::Error::VolumeStillInUse => {},
+                embedded_sdmmc_async::Error::VolumeAlreadyOpen => {},
+                embedded_sdmmc_async::Error::Unsupported => {},
+                embedded_sdmmc_async::Error::EndOfFile => {},
+                embedded_sdmmc_async::Error::BadCluster => {},
+                embedded_sdmmc_async::Error::ConversionError => {},
+                embedded_sdmmc_async::Error::NotEnoughSpace => {},
+                embedded_sdmmc_async::Error::AllocationError => {},
+                embedded_sdmmc_async::Error::UnterminatedFatChain => {},
+                embedded_sdmmc_async::Error::ReadOnly => {},
+                embedded_sdmmc_async::Error::FileAlreadyExists => {},
+                embedded_sdmmc_async::Error::BadBlockSize(_) => {},
+                embedded_sdmmc_async::Error::InvalidOffset => {},
+                embedded_sdmmc_async::Error::DiskFull => {},
+                embedded_sdmmc_async::Error::DirAlreadyExists => {},
+                embedded_sdmmc_async::Error::LockError => {},
             }
         }
-        f.write(&[0u8; 16]).unwrap();
-        
-        
-
-        f.close().unwrap();
     }
+
+    
 }
