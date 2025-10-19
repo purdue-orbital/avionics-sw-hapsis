@@ -5,15 +5,20 @@ use defmt::*;
 use embassy_executor::{Spawner, task};
 use embassy_stm32::gpio::{Level, Output, Speed};
 use embassy_time::{
-    Duration, Instant, Timer, WithTimeout
+    Duration, Instant, Timer, WithTimeout, Delay
 };
 use embassy_sync::{
     channel::Channel,
-    mutex::Mutex,
     blocking_mutex::raw::ThreadModeRawMutex,
 };
 use avionics_sw_hapsis::*;
 use {defmt_rtt as _, panic_probe as _};
+
+use embassy_stm32::spi::{BitOrder, Spi};
+use embassy_stm32::time::Hertz;
+use {defmt_rtt as _, panic_probe as _};
+use embedded_sdmmc::{sdcard::AcquireOpts, File, Mode, SdCard, TimeSource, Timestamp, VolumeIdx, VolumeManager};
+use embedded_hal_bus::spi::ExclusiveDevice;
 
 use libm::powf;
 
@@ -21,17 +26,100 @@ static BARO_DATA_CHANNEL: Channel<ThreadModeRawMutex, BaroData, 4> = Channel::ne
 static BARO_ALT_CHANNEL: Channel<ThreadModeRawMutex, f32, 4> = Channel::new(); // filtered altitude to send to control task
 static IMU_DATA_CHANNEL: Channel<ThreadModeRawMutex, ImuData, 4> = Channel::new(); // imu data to send to sd card and gnc
 
+/// Code from https://github.com/rp-rs/rp-hal-boards/blob/main/boards/rp-pico/examples/pico_spi_sd_card.rs
+/// A dummy timesource, which is mostly important for creating files.
+#[derive(Default)]
+pub struct DummyTimesource();
+
+impl TimeSource for DummyTimesource {
+    // In theory you could use the RTC of the rp2040 here, if you had
+    // any external time synchronizing device.
+    fn get_timestamp(&self) -> Timestamp {
+        Timestamp {
+            year_since_1970: 0,
+            zero_indexed_month: 0,
+            zero_indexed_day: 0,
+            hours: 0,
+            minutes: 0,
+            seconds: 0,
+        }
+    }
+}
+
+const FILE_TO_CREATE: &str = "CREATE.TXT";
+const BUFFER_MAX_LENGTH: u16 = 256;
+
 #[embassy_executor::main]
 async fn main(_spawner: Spawner) {
     let p = embassy_stm32::init(Default::default());
     info!("Hello World!");
+
+    let mut spi_config = embassy_stm32::spi::Config::default();
+    spi_config.frequency = Hertz(12_000_000);
+    spi_config.bit_order = BitOrder::MsbFirst;
+    spi_config.gpio_speed = Speed::Low;
+
+    let sck = p.PB13;
+    let mosi = p.PB15;
+    let miso = p.PB14;
+    let dma_tx = p.DMA1_CH4;
+    let dma_rx = p.DMA1_CH3;
+
+    let spi = Spi::new(p.SPI2, 
+        sck, 
+        mosi, 
+        miso,
+        dma_tx, 
+        dma_rx, 
+        spi_config
+    );
+
+    let spi_cs = Output::new(p.PA3, Level::High, Speed::Low);
+    let spi_dev = ExclusiveDevice::new(spi, spi_cs, Delay).unwrap();
+
+    let sd_card_options = AcquireOpts{use_crc: true, acquire_retries: 1};
+
+    let sd_card = SdCard::new_with_options(spi_dev, Delay, sd_card_options);
+
+    // info!("Init SD card controller and retrieve card size...");
+    // let sd_size = sd_card.num_bytes();
+
+    // match(sd_size) {
+    //     Ok(size) => {
+    //         info!("SD Card Size: {}", size);
+    //     },
+    //     Err(e) => {
+    //         info!("Error: {:?}", defmt::Debug2Format(&e));
+    //     }
+    // }
+
+    let volume_mgr: VolumeManager<SdCard<ExclusiveDevice<Spi<'_, embassy_stm32::mode::Async>, Output<'_>, Delay>, Delay>, DummyTimesource> = VolumeManager::new(sd_card, DummyTimesource::default());
+    // let volume = volume_mgr.open_volume(VolumeIdx(0)).unwrap();
+
+    // let root_dir = volume.open_root_dir().unwrap();
+    // info!("\nCreating file {}...", FILE_TO_CREATE);
+
+    // if (!root_dir.find_directory_entry(FILE_TO_CREATE).is_err()) {
+    //         info!("File with name {} already exists!", FILE_TO_CREATE);
+    //         root_dir.delete_file_in_dir(FILE_TO_CREATE).unwrap();
+    //         info!("Deleting File {}", FILE_TO_CREATE);
+
+    //     }
+    // let f: File<'_, SdCard<ExclusiveDevice<Spi<'_, embassy_stm32::mode::Async>, Output<'_>, Delay>, Delay>, DummyTimesource, 4, 4, 1> = root_dir.open_file_in_dir(FILE_TO_CREATE, Mode::ReadWriteCreate).unwrap();
+    // let mut start_timestamp: u32 = Instant::now().as_micros() as u32;
+    // f.write(&[0u8; 65536]).unwrap();
+    
+    // let mut end_timestamp: u32 = Instant::now().as_micros() as u32;
+    // info!("Diff: {}", end_timestamp - start_timestamp);
+
+    // f.close().unwrap();
 
     let led = Output::new(p.PB7, Level::High, Speed::Low);
 
     _spawner.spawn(control_task(led)).unwrap();
     _spawner.spawn(baro_task()).unwrap();
     _spawner.spawn(imu_task()).unwrap();
-    _spawner.spawn(log_task()).unwrap();
+    _spawner.spawn(log_task(volume_mgr)).unwrap();
 
     info!("All tasks spawned");
 }
@@ -71,7 +159,7 @@ async fn baro_task() {
 
     loop {
         // fake data
-        let time_stamp = Instant::now().as_micros() as u32;
+        let time_stamp: u32 = Instant::now().as_micros() as u32;
         let data = BaroData {
             pressure: 1013.25,
             temperature: 25.0,
@@ -159,7 +247,7 @@ async fn imu_task() {
 
 // receives sensor data, adds to byte buffer. Once buffer reaches 256 bytes writes data to sd card
 #[task]
-async fn log_task() {
+async fn log_task(mut vol_manager: VolumeManager<SdCard<ExclusiveDevice<Spi<'static, embassy_stm32::mode::Async>, Output<'static>, Delay>, Delay>, DummyTimesource>) {
     info!("Entered logging task");
 
     let mut buf_index: u16 = 0;
@@ -185,13 +273,46 @@ async fn log_task() {
         }
 
         // if byte buffer has 256 bytes, send to sd card
-        if buf_index >= 256 {
+        if buf_index >= BUFFER_MAX_LENGTH {
             info!("buffer full, writing to sd card");
-            buf_index -= 256;
+            write_to_sd_card(& mut vol_manager);
+            buf_index -= BUFFER_MAX_LENGTH;
         }
     
         // wait state to let other tasks run
         Timer::after(Duration::from_millis(50)).await;
 
+    }
+
+    fn write_to_sd_card(volume_mgr: & mut VolumeManager<SdCard<ExclusiveDevice<Spi<'static, embassy_stm32::mode::Async>, Output<'static>, Delay>, Delay>, DummyTimesource>) {
+         let volume = volume_mgr.open_volume(VolumeIdx(0)).unwrap();
+
+        let root_dir = volume.open_root_dir().unwrap();
+        info!("\nCreating file {}...", FILE_TO_CREATE);
+
+        // if (!root_dir.find_directory_entry(FILE_TO_CREATE).is_err()) {
+        //         info!("File with name {} already exists!", FILE_TO_CREATE);
+        //         root_dir.delete_file_in_dir(FILE_TO_CREATE).unwrap();
+        //         info!("Deleting File {}", FILE_TO_CREATE);
+        //     }
+        let f: File<'_, SdCard<ExclusiveDevice<Spi<'_, embassy_stm32::mode::Async>, Output<'_>, Delay>, Delay>, DummyTimesource, 4, 4, 1> = root_dir.open_file_in_dir(FILE_TO_CREATE, Mode::ReadWriteCreateOrAppend).unwrap();
+        let mut start_timestamp: u32 = Instant::now().as_micros() as u32;
+        match f.write(&[0u8; 8192]) {
+            Ok(_) => {
+                let mut end_timestamp: u32 = Instant::now().as_micros() as u32;
+                info!("Diff: {}", end_timestamp - start_timestamp);
+            },
+
+            Err(e) => {
+                let mut end_timestamp: u32 = Instant::now().as_micros() as u32;
+                error!("Diff: {}", end_timestamp - start_timestamp);
+                
+            }
+        }
+        f.write(&[0u8; 16]).unwrap();
+        
+        
+
+        f.close().unwrap();
     }
 }

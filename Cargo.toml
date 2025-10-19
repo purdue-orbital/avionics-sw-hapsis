@@ -30,6 +30,7 @@ usbd-hid = "0.8.1"
 static_cell = "2"
 chrono = { version = "^0.4", default-features = false}
 libm = "0.2.6"
+embedded-sdmmc = {version="*", features=["log"]}
 
 [profile.release]
 debug = 2
