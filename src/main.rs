@@ -1,7 +1,8 @@
 #![no_std]
 #![no_main]
 
-use chrono::format;
+use core::{cell::RefCell};
+
 use defmt::*;
 use embassy_executor::{Spawner, task};
 use embassy_stm32::gpio::{Level, Output, Speed};
@@ -9,8 +10,7 @@ use embassy_time::{
     Duration, Instant, Timer, WithTimeout, Delay
 };
 use embassy_sync::{
-    channel::Channel,
-    blocking_mutex::raw::ThreadModeRawMutex,
+    blocking_mutex::raw::{CriticalSectionRawMutex, ThreadModeRawMutex}, channel::Channel, mutex::Mutex
 };
 use avionics_sw_hapsis::*;
 use {defmt_rtt as _, panic_probe as _};
@@ -18,7 +18,7 @@ use {defmt_rtt as _, panic_probe as _};
 use embassy_stm32::spi::{BitOrder, Spi};
 use embassy_stm32::time::Hertz;
 use {defmt_rtt as _, panic_probe as _};
-use embedded_sdmmc_async::{sdcard::{self, AcquireOpts}, File, Mode, SdCard, TimeSource, Timestamp, Volume, VolumeIdx, VolumeManager};
+use embedded_sdmmc_async::{sdcard::{AcquireOpts}, File, Mode, SdCard, TimeSource, Timestamp, VolumeIdx, VolumeManager};
 use embedded_hal_bus::spi::ExclusiveDevice;
 
 use libm::powf;
@@ -47,12 +47,12 @@ impl TimeSource for DummyTimesource {
     }
 }
 
-const FILE_TO_CREATE: &str = "CREATE.TXT";
+const IMU_FILENAME: &str = "IMU.TXT";
+const BARO_FILENAME: &str = "BARO.TXT";
 const BUFFER_MAX_LENGTH: usize = 256;
 
-const MAX_DIRS: usize = 4;
-const MAX_FILES: usize = 4;
-const MAX_VOLUMES: usize = 1;
+static IMU_GLOBAL_COUNT: Mutex<CriticalSectionRawMutex, RefCell<u32>> = Mutex::new(RefCell::new(0));
+static BARO_GLOBAL_COUNT: Mutex<CriticalSectionRawMutex, RefCell<u32>> = Mutex::new(RefCell::new(0));
 
 #[embassy_executor::main]
 async fn main(_spawner: Spawner) {
@@ -89,7 +89,7 @@ async fn main(_spawner: Spawner) {
     info!("Init SD card controller and retrieve card size...");
     let sd_size = sd_card.num_bytes().await;
 
-    match(sd_size) {
+    match sd_size {
         Ok(size) => {
             info!("SD Card Size: {}", size);
         },
@@ -99,25 +99,6 @@ async fn main(_spawner: Spawner) {
     }
 
     let volume_mgr: VolumeManager<SdCard<ExclusiveDevice<Spi<'_, embassy_stm32::mode::Async>, Output<'_>, Delay>, Delay>, DummyTimesource> = VolumeManager::new(sd_card, DummyTimesource::default());
-    // let mut volume: embedded_sdmmc_async::Volume<'_, SdCard<ExclusiveDevice<Spi<'_, embassy_stm32::mode::Async>, Output<'_>, Delay>, Delay>, DummyTimesource, 4, 4, 1> = volume_mgr.open_volume(VolumeIdx(0)).await.unwrap();
-
-    // let root_dir = volume.open_root_dir().unwrap();
-    // info!("\nCreating file {}...", FILE_TO_CREATE);
-
-    // if (!root_dir.find_directory_entry(FILE_TO_CREATE).is_err()) {
-    //         info!("File with name {} already exists!", FILE_TO_CREATE);
-    //         root_dir.delete_file_in_dir(FILE_TO_CREATE).unwrap();
-    //         info!("Deleting File {}", FILE_TO_CREATE);
-
-    //     }
-    // let f: File<'_, SdCard<ExclusiveDevice<Spi<'_, embassy_stm32::mode::Async>, Output<'_>, Delay>, Delay>, DummyTimesource, 4, 4, 1> = root_dir.open_file_in_dir(FILE_TO_CREATE, Mode::ReadWriteCreate).unwrap();
-    // let mut start_timestamp: u32 = Instant::now().as_micros() as u32;
-    // f.write(&[0u8; 65536]).unwrap();
-    
-    // let mut end_timestamp: u32 = Instant::now().as_micros() as u32;
-    // info!("Diff: {}", end_timestamp - start_timestamp);
-
-    // f.close().unwrap();
     let led = Output::new(p.PB7, Level::High, Speed::Low);
 
     _spawner.spawn(control_task(led)).unwrap();
@@ -264,6 +245,18 @@ async fn log_task(volume_mgr: VolumeManager<SdCard<ExclusiveDevice<Spi<'static, 
             let pressure: [u8; 4] = data.pressure.to_le_bytes();
             let temperature: [u8; 4] = data.temperature.to_le_bytes();
             let timestamp: [u8; 4] = data.time_stamp.to_le_bytes();
+            let baro_line = heapless::format!(100; "received baro data: p: {}, t: {}, ts: {}\r\n", data.pressure, data.temperature, data.time_stamp).unwrap();
+
+            write_to_sd_card(&volume_mgr, baro_line.as_str(), BARO_FILENAME).await;
+
+            {
+                let baro_lock = BARO_GLOBAL_COUNT.lock().await;
+                let mut baro_count_ref = baro_lock.borrow_mut();
+                *baro_count_ref += 1;
+                info!("Wrote Baro Data to SD Card {} Times!\n", *baro_count_ref);
+
+            }
+
             for byte in pressure {
                 buf[buf_index] = byte;
                 buf_index += 1;
@@ -284,14 +277,21 @@ async fn log_task(volume_mgr: VolumeManager<SdCard<ExclusiveDevice<Spi<'static, 
                 data.gyro[0], data.gyro[1], data.gyro[2],
                 data.mag[0], data.mag[1], data.mag[2],
                 data.time_stamp);
+
             let imu_line = heapless::format!(100; "received imu data: a: ({}, {}, {}), g: ({}, {}, {}), m: ({}, {}, {}), ts: {}\r\n", 
                 data.acceleration[0], data.acceleration[1], data.acceleration[2],
                 data.gyro[0], data.gyro[1], data.gyro[2],
                 data.mag[0], data.mag[1], data.mag[2],
                 data.time_stamp).unwrap();
 
+            write_to_sd_card(&volume_mgr, imu_line.as_str(), IMU_FILENAME).await;
 
-            write_to_sd_card(&volume_mgr, imu_line.as_str()).await;
+            {
+                let imu_lock = IMU_GLOBAL_COUNT.lock().await;
+                let mut imu_count_ref = imu_lock.borrow_mut();
+                *imu_count_ref += 1;
+                info!("Wrote IMU Data to SD Card {} Times!\n", *imu_count_ref);
+            }
 
             for i in 0..3 {
                 for byte in data.acceleration[i].to_le_bytes() {
@@ -334,29 +334,23 @@ async fn log_task(volume_mgr: VolumeManager<SdCard<ExclusiveDevice<Spi<'static, 
     }
 }
 
-async fn write_to_sd_card(volume_mgr: &  VolumeManager<SdCard<ExclusiveDevice<Spi<'_, embassy_stm32::mode::Async>, Output<'_>, Delay>, Delay>, DummyTimesource>, buf: &str) {
+async fn write_to_sd_card(volume_mgr: &  VolumeManager<SdCard<ExclusiveDevice<Spi<'_, embassy_stm32::mode::Async>, Output<'_>, Delay>, Delay>, DummyTimesource>, buf: &str, filename: &str) {
     let volume_future = volume_mgr.open_volume(VolumeIdx(0)).await;
 
     match volume_future {
         Ok(volume) => {
             let root_dir = volume.open_root_dir().await.unwrap();
-            info!("\nCreating or Appending file {}...", FILE_TO_CREATE);
-
-            // if (!root_dir.find_directory_entry(FILE_TO_CREATE).is_err()) {
-            //         info!("File with name {} already exists!", FILE_TO_CREATE);
-            //         root_dir.delete_file_in_dir(FILE_TO_CREATE).unwrap();
-            //         info!("Deleting File {}", FILE_TO_CREATE);
-            //     }
-            let f: File<'_, SdCard<ExclusiveDevice<Spi<'_, embassy_stm32::mode::Async>, Output<'_>, Delay>, Delay>, DummyTimesource, 4, 4, 1> = root_dir.open_file_in_dir(FILE_TO_CREATE, Mode::ReadWriteCreateOrAppend).await.unwrap();
-            let mut start_timestamp: u32 = Instant::now().as_micros() as u32;
+            info!("\nCreating or Appending file {}...", filename);
+            let f: File<'_, SdCard<ExclusiveDevice<Spi<'_, embassy_stm32::mode::Async>, Output<'_>, Delay>, Delay>, DummyTimesource, _, _, _> = root_dir.open_file_in_dir(filename, Mode::ReadWriteCreateOrAppend).await.unwrap();
+            let start_timestamp: u32 = Instant::now().as_micros() as u32;
             match f.write(buf.as_bytes()).await {
                 Ok(_) => {
-                    let mut end_timestamp: u32 = Instant::now().as_micros() as u32;
+                    let end_timestamp: u32 = Instant::now().as_micros() as u32;
                     info!("Diff: {}", end_timestamp - start_timestamp);
                 },
 
-                Err(e) => {
-                    let mut end_timestamp: u32 = Instant::now().as_micros() as u32;
+                Err(_) => {
+                    let end_timestamp: u32 = Instant::now().as_micros() as u32;
                     error!("Diff: {}", end_timestamp - start_timestamp);
                     
                 }
@@ -369,38 +363,6 @@ async fn write_to_sd_card(volume_mgr: &  VolumeManager<SdCard<ExclusiveDevice<Sp
 
         Err(e) => {
             error!("{}", defmt::Debug2Format(&e));
-            match (&e) {
-                embedded_sdmmc_async::Error::TooManyOpenVolumes=>{}
-                embedded_sdmmc_async::Error::DeviceError(_) => {},
-                embedded_sdmmc_async::Error::FormatError(_) => {},
-                embedded_sdmmc_async::Error::NoSuchVolume => {},
-                embedded_sdmmc_async::Error::FilenameError(filename_error) => {},
-                embedded_sdmmc_async::Error::TooManyOpenDirs => {},
-                embedded_sdmmc_async::Error::TooManyOpenFiles => {},
-                embedded_sdmmc_async::Error::BadHandle => {},
-                embedded_sdmmc_async::Error::NotFound => {},
-                embedded_sdmmc_async::Error::FileAlreadyOpen => {},
-                embedded_sdmmc_async::Error::DirAlreadyOpen => {},
-                embedded_sdmmc_async::Error::OpenedDirAsFile => {},
-                embedded_sdmmc_async::Error::OpenedFileAsDir => {},
-                embedded_sdmmc_async::Error::DeleteDirAsFile => {},
-                embedded_sdmmc_async::Error::VolumeStillInUse => {},
-                embedded_sdmmc_async::Error::VolumeAlreadyOpen => {},
-                embedded_sdmmc_async::Error::Unsupported => {},
-                embedded_sdmmc_async::Error::EndOfFile => {},
-                embedded_sdmmc_async::Error::BadCluster => {},
-                embedded_sdmmc_async::Error::ConversionError => {},
-                embedded_sdmmc_async::Error::NotEnoughSpace => {},
-                embedded_sdmmc_async::Error::AllocationError => {},
-                embedded_sdmmc_async::Error::UnterminatedFatChain => {},
-                embedded_sdmmc_async::Error::ReadOnly => {},
-                embedded_sdmmc_async::Error::FileAlreadyExists => {},
-                embedded_sdmmc_async::Error::BadBlockSize(_) => {},
-                embedded_sdmmc_async::Error::InvalidOffset => {},
-                embedded_sdmmc_async::Error::DiskFull => {},
-                embedded_sdmmc_async::Error::DirAlreadyExists => {},
-                embedded_sdmmc_async::Error::LockError => {},
-            }
         }
     }
 
