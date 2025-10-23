@@ -5,21 +5,23 @@ use core::{cell::RefCell};
 
 use defmt::*;
 use embassy_executor::{Spawner, task};
-use embassy_stm32::gpio::{Level, Output, Speed};
+use embassy_stm32::{bind_interrupts, gpio::{Level, Output, Speed}, i2c::{self, I2c}, peripherals};
 use embassy_time::{
     Duration, Instant, Timer, WithTimeout, Delay
 };
 use embassy_sync::{
-    blocking_mutex::raw::{CriticalSectionRawMutex, ThreadModeRawMutex}, channel::Channel, mutex::Mutex
+    blocking_mutex::raw::{CriticalSectionRawMutex, ThreadModeRawMutex}, channel::Channel, mutex::{self, Mutex}
 };
 use avionics_sw_hapsis::*;
+use embedded_hal::delay::DelayNs;
+use static_cell::StaticCell;
 use {defmt_rtt as _, panic_probe as _};
 
 use embassy_stm32::spi::{BitOrder, Spi};
 use embassy_stm32::time::Hertz;
 use {defmt_rtt as _, panic_probe as _};
 use embedded_sdmmc_async::{sdcard::{AcquireOpts}, File, Mode, SdCard, TimeSource, Timestamp, VolumeIdx, VolumeManager};
-use embedded_hal_bus::spi::ExclusiveDevice;
+use bme280::i2c::AsyncBME280;
 
 use libm::powf;
 
@@ -51,8 +53,18 @@ const IMU_FILENAME: &str = "IMU.TXT";
 const BARO_FILENAME: &str = "BARO.TXT";
 const BUFFER_MAX_LENGTH: usize = 256;
 
+// Count of how many times IMU and Barometer has called a read/write to SD Card
 static IMU_GLOBAL_COUNT: Mutex<CriticalSectionRawMutex, RefCell<u32>> = Mutex::new(RefCell::new(0));
 static BARO_GLOBAL_COUNT: Mutex<CriticalSectionRawMutex, RefCell<u32>> = Mutex::new(RefCell::new(0));
+
+// Create a Static Cell Guarding a Mutex that holds the reference to an SPI or I2C Bus so that the lifetime of the repsective bus can be global
+static BUS: StaticCell<Mutex<CriticalSectionRawMutex, Spi<'static, embassy_stm32::mode::Async>>> = StaticCell::new();
+static I2C_BUS: StaticCell<Mutex<CriticalSectionRawMutex, I2c<'static, embassy_stm32::mode::Async, i2c::Master>>> = StaticCell::new();
+
+bind_interrupts!(struct Irqs {
+    I2C2_EV => i2c::EventInterruptHandler<peripherals::I2C2>;
+    I2C2_ER => i2c::ErrorInterruptHandler<peripherals::I2C2>;
+});
 
 #[embassy_executor::main]
 async fn main(_spawner: Spawner) {
@@ -64,10 +76,12 @@ async fn main(_spawner: Spawner) {
     spi_config.bit_order = BitOrder::MsbFirst;
     spi_config.gpio_speed = Speed::Low;
 
+    let mut i2c_config = embassy_stm32::i2c::Config::default();
+
     let sck = p.PB13;
     let mosi = p.PB15;
     let miso = p.PB14;
-    let dma_tx = p.DMA1_CH4;
+    let dma_tx = p.DMA1_CH4; 
     let dma_rx = p.DMA1_CH3;
 
     let spi = Spi::new(p.SPI2, 
@@ -79,9 +93,32 @@ async fn main(_spawner: Spawner) {
         spi_config
     );
 
-    let spi_cs = Output::new(p.PA3, Level::High, Speed::Low);
-    let spi_dev = ExclusiveDevice::new(spi, spi_cs, Delay).unwrap();
+    let scl = p.PB10;
+    let sda = p.PB11;
+    let i2c_tx_dma = p.DMA1_CH7;
+    let i2c_rx_dma = p.DMA1_CH2;
 
+
+    let i2c = embassy_stm32::i2c::I2c::new(p.I2C2, scl, sda, Irqs, i2c_tx_dma, i2c_rx_dma, i2c_config);
+
+    let spi_cs = Output::new(p.PA3, Level::High, Speed::Low);
+    // let bme280_cs = Output::new(p.PA1, Level::High, Speed::Low);
+    let i2c_guard: Mutex<CriticalSectionRawMutex, I2c<'_, embassy_stm32::mode::Async, i2c::Master>> = embassy_sync::mutex::Mutex::new(i2c);
+
+    let mutex_guard = BUS.init(embassy_sync::mutex::Mutex::new(spi));
+    
+    let spi_dev =  embassy_embedded_hal::shared_bus::asynch::spi::SpiDeviceWithConfig::new(mutex_guard, spi_cs, spi_config);
+    // let spi_dev2 =  embassy_embedded_hal::shared_bus::asynch::spi::SpiDeviceWithConfig::new(mutex_guard, spi_cs2, spi_config);
+
+    let bme_i2c_dev = embassy_embedded_hal::shared_bus::asynch::i2c::I2cDevice::new(I2C_BUS.init(i2c_guard));
+
+    info!("Initializing BME280");
+    let mut bme280_dev: AsyncBME280<embassy_embedded_hal::shared_bus::asynch::i2c::I2cDevice<'_, CriticalSectionRawMutex, I2c<'_, embassy_stm32::mode::Async, i2c::Master>>> = AsyncBME280::new(bme_i2c_dev, 0x76);
+    match bme280_dev.init(& mut Delay).await {
+        Ok(_) => {info!("BME Loaded Successfully!")},
+        Err(e) => {error!("BME Error! {}", Debug2Format(&e))},
+    }
+    
     let sd_card_options = AcquireOpts{use_crc: true, acquire_retries: 5};
 
     let sd_card = SdCard::new_with_options(spi_dev, Delay, sd_card_options);
@@ -98,11 +135,11 @@ async fn main(_spawner: Spawner) {
         }
     }
 
-    let volume_mgr: VolumeManager<SdCard<ExclusiveDevice<Spi<'_, embassy_stm32::mode::Async>, Output<'_>, Delay>, Delay>, DummyTimesource> = VolumeManager::new(sd_card, DummyTimesource::default());
+    let volume_mgr = VolumeManager::new(sd_card, DummyTimesource::default());
     let led = Output::new(p.PB7, Level::High, Speed::Low);
 
     _spawner.spawn(control_task(led)).unwrap();
-    _spawner.spawn(baro_task()).unwrap();
+    _spawner.spawn(baro_task(bme280_dev)).unwrap();
     _spawner.spawn(imu_task()).unwrap();
     _spawner.spawn(log_task(volume_mgr)).unwrap();
 
@@ -135,19 +172,22 @@ async fn control_task(mut led: Output<'static>) {
 // sends filtered data to control task at low rate (1Hz or so)
 // sends data to logging task at higher rate (10-20Hz)
 #[task]
-async fn baro_task() {
+async fn baro_task(mut bme280_dev: AsyncBME280<embassy_embedded_hal::shared_bus::asynch::i2c::I2cDevice<'static, CriticalSectionRawMutex, I2c<'static, embassy_stm32::mode::Async, i2c::Master>>>) {
     info!("Starting barometer task");
 
     // altitude filter buffer
     // we start at 0m altitude so we don't need to fill the buffer with initial values
     let mut alt_buffer: [f32; 10] = [0.0; 10];
 
+
     loop {
-        // fake data
+        // Read data
+        let measurement = bme280_dev.measure(& mut Delay).await.map_err(|e| {error!("BME Read Error! {}", Debug2Format(&e))}).unwrap();
         let time_stamp: u32 = Instant::now().as_micros() as u32;
         let data = BaroData {
-            pressure: 1013.25,
-            temperature: 25.0,
+            pressure: measurement.pressure,
+            temperature: measurement.temperature,
+            
             time_stamp: time_stamp,
         };
 
@@ -232,7 +272,7 @@ async fn imu_task() {
 
 // receives sensor data, adds to byte buffer. Once buffer reaches 256 bytes writes data to sd card
 #[task]
-async fn log_task(volume_mgr: VolumeManager<SdCard<ExclusiveDevice<Spi<'static, embassy_stm32::mode::Async>, Output<'static>, Delay>, Delay>, DummyTimesource>) {
+async fn log_task(volume_mgr: VolumeManager<SdCard<embassy_embedded_hal::shared_bus::asynch::spi::SpiDeviceWithConfig<'static, CriticalSectionRawMutex, Spi<'static, embassy_stm32::mode::Async>, Output<'static>>, Delay>, DummyTimesource>) {
     info!("Entered logging task");
 
     let mut buf_index: usize = 0;
@@ -254,8 +294,11 @@ async fn log_task(volume_mgr: VolumeManager<SdCard<ExclusiveDevice<Spi<'static, 
                 let mut baro_count_ref = baro_lock.borrow_mut();
                 *baro_count_ref += 1;
                 info!("Wrote Baro Data to SD Card {} Times!\n", *baro_count_ref);
-
             }
+
+            // if (buf_index + 12 >= BUFFER_MAX_LENGTH) {
+            //     write_to_sd_card_buffer(&volume_mgr, & buf, BARO_FILENAME).await;
+            // }
 
             for byte in pressure {
                 buf[buf_index] = byte;
@@ -283,6 +326,8 @@ async fn log_task(volume_mgr: VolumeManager<SdCard<ExclusiveDevice<Spi<'static, 
                 data.gyro[0], data.gyro[1], data.gyro[2],
                 data.mag[0], data.mag[1], data.mag[2],
                 data.time_stamp).unwrap();
+
+            
 
             write_to_sd_card(&volume_mgr, imu_line.as_str(), IMU_FILENAME).await;
 
@@ -325,7 +370,7 @@ async fn log_task(volume_mgr: VolumeManager<SdCard<ExclusiveDevice<Spi<'static, 
         // if buf_index >= BUFFER_MAX_LENGTH {
         // info!("buffer full, writing to sd card");
         // write_to_sd_card(& volume_mgr, buf).await;
-        buf_index = 0;
+            buf_index = 0;
         // }
     
         // wait state to let other tasks run
@@ -334,14 +379,14 @@ async fn log_task(volume_mgr: VolumeManager<SdCard<ExclusiveDevice<Spi<'static, 
     }
 }
 
-async fn write_to_sd_card(volume_mgr: &  VolumeManager<SdCard<ExclusiveDevice<Spi<'_, embassy_stm32::mode::Async>, Output<'_>, Delay>, Delay>, DummyTimesource>, buf: &str, filename: &str) {
+async fn write_to_sd_card(volume_mgr: &  VolumeManager<SdCard<embassy_embedded_hal::shared_bus::asynch::spi::SpiDeviceWithConfig<'static, CriticalSectionRawMutex, Spi<'static, embassy_stm32::mode::Async>, Output<'static>>, Delay>, DummyTimesource>, buf: &str, filename: &str) {
     let volume_future = volume_mgr.open_volume(VolumeIdx(0)).await;
 
     match volume_future {
         Ok(volume) => {
             let root_dir = volume.open_root_dir().await.unwrap();
             info!("\nCreating or Appending file {}...", filename);
-            let f: File<'_, SdCard<ExclusiveDevice<Spi<'_, embassy_stm32::mode::Async>, Output<'_>, Delay>, Delay>, DummyTimesource, _, _, _> = root_dir.open_file_in_dir(filename, Mode::ReadWriteCreateOrAppend).await.unwrap();
+            let f = root_dir.open_file_in_dir(filename, Mode::ReadWriteCreateOrAppend).await.unwrap();
             let start_timestamp: u32 = Instant::now().as_micros() as u32;
             match f.write(buf.as_bytes()).await {
                 Ok(_) => {
@@ -349,10 +394,10 @@ async fn write_to_sd_card(volume_mgr: &  VolumeManager<SdCard<ExclusiveDevice<Sp
                     info!("Diff: {}", end_timestamp - start_timestamp);
                 },
 
-                Err(_) => {
+                Err(e) => {
                     let end_timestamp: u32 = Instant::now().as_micros() as u32;
                     error!("Diff: {}", end_timestamp - start_timestamp);
-                    
+                    error!("{}", defmt::Debug2Format(&e));
                 }
             }
             
@@ -367,4 +412,38 @@ async fn write_to_sd_card(volume_mgr: &  VolumeManager<SdCard<ExclusiveDevice<Sp
     }
 
     
+}
+
+                
+async fn write_to_sd_card_buffer(volume_mgr: &  VolumeManager<SdCard<embassy_embedded_hal::shared_bus::asynch::spi::SpiDeviceWithConfig<'static, CriticalSectionRawMutex, Spi<'static, embassy_stm32::mode::Async>, Output<'static>>, Delay>, DummyTimesource>, buf: &[u8; BUFFER_MAX_LENGTH], filename: &str) {
+let volume_future = volume_mgr.open_volume(VolumeIdx(0)).await;
+
+    match volume_future {
+        Ok(volume) => {
+            let root_dir = volume.open_root_dir().await.unwrap();
+            info!("\nCreating or Appending file {}...", filename);
+            let f = root_dir.open_file_in_dir(filename, Mode::ReadWriteCreateOrAppend).await.unwrap();
+            let start_timestamp: u32 = Instant::now().as_micros() as u32;
+            match f.write(buf).await {
+                Ok(_) => {
+                    let end_timestamp: u32 = Instant::now().as_micros() as u32;
+                    info!("Diff: {}", end_timestamp - start_timestamp);
+                },
+
+                Err(e) => {
+                    let end_timestamp: u32 = Instant::now().as_micros() as u32;
+                    error!("Diff: {}", end_timestamp - start_timestamp);
+                    error!("{}", defmt::Debug2Format(&e));
+                }
+            }
+            
+            f.close().await.unwrap();
+            root_dir.close().unwrap();
+            volume.close().await.unwrap();
+        },
+
+        Err(e) => {
+            error!("{}", defmt::Debug2Format(&e));
+        }
+    }
 }

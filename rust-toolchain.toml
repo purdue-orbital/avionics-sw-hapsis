@@ -1,0 +1,3 @@
+[toolchain]
+channel = "nightly" # Or "stable", "1.83.0", etc.
+components = ["rust-analyzer", "clippy"] # Include desired components

@@ -1,0 +1,79 @@
+{
+    // Use IntelliSense to learn about possible attributes.
+    // Hover to view descriptions of existing attributes.
+    // For more information, visit: https://go.microsoft.com/fwlink/?linkid=830387
+    "version": "0.2.0",
+    "configurations": [
+        
+        {
+            "cwd": "${workspaceFolder}",
+            "executable": "./target/thumbv7em-none-eabihf/debug/avionics-sw-hapsis",
+            "name": "Debug with ST-Link",
+            "request": "launch",
+            "type": "cortex-debug",
+            "runToEntryPoint": "main",
+            "showDevDebugOutput": "none",
+            "servertype": "stlink",
+            "gdbPath": "gdb-multiarch",
+            "device": "STM32F407GVTx"
+        },
+    
+        {
+            "type": "probe-rs-debug",
+            "request": "launch",
+            "name": "probe-rs Test",
+            "cwd": "${workspaceFolder}",
+            "connectUnderReset": true,
+            "chip": "STM32F407VGTx",
+            "flashingConfig": {
+                "flashingEnabled": true,
+                "haltAfterReset": true
+            },
+            
+            "coreConfigs": [
+                {
+                    "coreIndex": 0,
+                    "programBinary": "./target/thumbv7em-none-eabi/debug/${workspaceFolderBasename}"
+                }
+            ]
+        },
+
+        {
+            
+            "type": "probe-rs-debug",
+            "name": "probe-rs Attach",
+            "request": "attach",
+            "chip": "STM32F407VGTx",
+            "coreConfigs": [
+                {
+                    "coreIndex": 0,
+                    "programBinary": "./target/thumbv7em-none-eabi/debug/${workspaceFolderBasename}"
+                }
+            ],
+            "connectUnderReset": false
+            
+        },
+
+        {
+            "type": "cortex-debug",
+            "name": "Cortex Debug",
+            "request": "launch",
+            "executable": "${workspaceFolder}/target/thumbv7em-none-eabi/debug/avionics-sw-hapsis",
+            "cwd": "${workspaceFolder}",
+            "servertype": "openocd",
+            "interface": "swd",
+            "device": "STM32F407VGTx",
+            "gdbPath": "gdb-multiarch",
+            "configFiles": ["interface/stlink-v2-1.cfg", "target/stm32f4x.cfg"],
+            "liveWatch": {
+                "enabled": true,
+                "samplesPerSecond": 4
+            },
+            "preRestartCommands": [
+                "load",
+                "break main",
+                "monitor reset"
+            ]
+        }
+    ]
+}
