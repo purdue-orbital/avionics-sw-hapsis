@@ -3,6 +3,14 @@
 version = 4
 
 [[package]]
+name = "adxl345-eh-driver"
+version = "0.2.2"
+dependencies = [
+ "bitfield 0.17.0",
+ "embedded-hal-async",
+]
+
+[[package]]
 name = "ahash"
 version = "0.8.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -42,6 +50,7 @@ checksum = "c08606f8c3cbf4ce6ec8e28fb0014a2c086708fe954eaa885384a6165172e7e8"
 name = "avionics-sw-hapsis"
 version = "0.1.0"
 dependencies = [
+ "adxl345-eh-driver",
  "bme280",
  "chrono",
  "cortex-m",
@@ -97,6 +106,12 @@ name = "bitfield"
 version = "0.14.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2d7e60934ceec538daadb9d8432424ed043a904d8e0243f3c6446bce549a46ac"
+
+[[package]]
+name = "bitfield"
+version = "0.17.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f798d2d157e547aa99aab0967df39edd0b70307312b6f8bd2848e6abe40896e0"
 
 [[package]]
 name = "bitflags"
@@ -561,9 +576,12 @@ dependencies = [
 
 [[package]]
 name = "embedded-sdmmc-async"
-version = "0.9.1"
+version = "0.9.0"
 dependencies = [
  "byteorder",
+ "cortex-m-rt",
+ "embassy-executor",
+ "embassy-sync",
  "embedded-hal-async",
  "embedded-io",
  "embedded-io-async",

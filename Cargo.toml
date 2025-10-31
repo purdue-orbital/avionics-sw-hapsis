@@ -32,7 +32,8 @@ chrono = { version = "^0.4", default-features = false}
 libm = "0.2.6"
 embedded-sdmmc-async = {path = "../embedded-sdmmc-rs-async-attempt"}
 embassy-embedded-hal = "*"
-bme280 = {path = "../bme280-rs", features = ["with_defmt"]}
+bme280 = {path = "../bme280-rs-async-default", features = ["with_defmt"]}
+adxl345-eh-driver = {path = "../adxl234-rs"}
 
 [profile.dev]
 debug = true
