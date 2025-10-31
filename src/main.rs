@@ -69,9 +69,12 @@ static BARO_GLOBAL_COUNT: Mutex<CriticalSectionRawMutex, RefCell<u32>> = Mutex::
 static BUS: StaticCell<Mutex<CriticalSectionRawMutex, Spi<'static, embassy_stm32::mode::Async>>> = StaticCell::new();
 static I2C_BUS: StaticCell<Mutex<CriticalSectionRawMutex, I2c<'static, embassy_stm32::mode::Async, i2c::Master>>> = StaticCell::new();
 
+// Changes the rate at which the CPU gets data from the sensors
 static BARO_MILLIS_DELAY: u64 = 20;
 static IMU_MILLIS_DELAY: u64 = 20;
 
+// Changes the rate at which the logging task polls from the channel
+// This should be less than their corresponding sensor polling rate to limit the data channels being full
 static BARO_POLL_MILLIS_DELAY: u64 = 1;
 static IMU_POLL_MILLIS_DELAY: u64 = 1;
 
@@ -91,6 +94,7 @@ static BME_I2C_ADDR: u8 = 0x76;
 
 static CONTROL_TASK_DELAY_MILLIS: u64 = 100;
 
+// Used to initialize a static reference to the SDCard's Volume Manager
 static VOLUME_MANAGER: StaticCell<VolumeManagerType> = StaticCell::new();
 
 bind_interrupts!(struct Irqs {
@@ -132,19 +136,21 @@ async fn main(_spawner: Spawner) {
 
     let i2c = embassy_stm32::i2c::I2c::new(p.I2C2, scl, sda, Irqs, i2c_tx_dma, i2c_rx_dma, i2c_config);
 
-    let i2c_guard = embassy_sync::mutex::Mutex::new(i2c);
+    let i2c_mutex_guard = embassy_sync::mutex::Mutex::new(i2c);
 
-    let mutex_guard: &mut Mutex<CriticalSectionRawMutex, Spi<'static, embassy_stm32::mode::Async>> = BUS.init(embassy_sync::mutex::Mutex::new(spi));
+    let spi_mutex_guard: &mut Mutex<CriticalSectionRawMutex, Spi<'static, embassy_stm32::mode::Async>> = BUS.init(embassy_sync::mutex::Mutex::new(spi));
 
+    // SPI Chip Select Pin
     let spi_cs = Output::new(p.PA3, Level::High, Speed::Low);
 
-    let i2c_bus = I2C_BUS.init(i2c_guard);
+    // I2C Bus
+    let i2c_bus = I2C_BUS.init(i2c_mutex_guard);
    
     let led = Output::new(p.PB7, Level::High, Speed::Low);
 
     _spawner.spawn(control_task(led)).unwrap();
 
-    let spi_dev =  embassy_embedded_hal::shared_bus::asynch::spi::SpiDeviceWithConfig::new(mutex_guard, spi_cs, spi_config);
+    let spi_dev =  embassy_embedded_hal::shared_bus::asynch::spi::SpiDeviceWithConfig::new(spi_mutex_guard, spi_cs, spi_config);
 
     // Set up the SD Card for initialization and allow cyclic redundancy check
     let sd_card_options = AcquireOpts{use_crc: true, acquire_retries: 5};
@@ -220,9 +226,10 @@ async fn control_task(mut led: Output<'static>) {
 async fn baro_task(i2c_mutex_bus: &'static I2cMutexType) {
     info!("Starting barometer task");
 
+    // Initialize BME280 I2C Driver forever with a timeout after each error, so other parts of the program can continue
+    // Initialize I2C Bus
     let bme_i2c_dev = embassy_embedded_hal::shared_bus::asynch::i2c::I2cDevice::new(i2c_mutex_bus);
 
-    // Initialize BME280 I2C Driver
     info!("Initializing BME 280");
     let mut bme280_dev = AsyncBME280::new(bme_i2c_dev, BME_I2C_ADDR);
     loop {
@@ -304,6 +311,7 @@ async fn imu_task(i2c_bus: &'static I2cMutexType) {
     info!("Starting imu task");
 
     // Initialize ADXL 345 I2C Device
+    // Initialize I2C Bus
     let adxl_i2c = embassy_embedded_hal::shared_bus::asynch::i2c::I2cDevice::new(i2c_bus);
 
     // 0x1D is the alt address depending on grounding of SDO or not in my case it is grounded
@@ -323,42 +331,43 @@ async fn imu_task(i2c_bus: &'static I2cMutexType) {
     
 
     loop {
+
         let time_stamp: u32 = Instant::now().as_micros() as u32;
-        {
-            
-            match adxl345.get_accel().await {
-                Ok(data) => {
-                    let data = ImuData {
-                        acceleration: [data.0, data.1, data.2],
-                        gyro: [0.0, 0.0, 0.0],
-                        mag: [0.0, 0.0, 0.0],
-                        time_stamp: time_stamp,
-                    };
 
-                    // try sending data, if channel is full, flush it and send again
-                    match IMU_DATA_CHANNEL.try_send(data) {
-                        Ok(_) => {
-                            info!("sent imu data: a: ({}, {}, {}), g: ({}, {}, {}), m: ({}, {}, {}), ts: {}", 
-                                data.acceleration[0], data.acceleration[1], data.acceleration[2],
-                                data.gyro[0], data.gyro[1], data.gyro[2],
-                                data.mag[0], data.mag[1], data.mag[2],
-                                data.time_stamp);
-                        }
-                        Err(_) => {
-                            warn!("imu data channel full, flushing data");
-                            // IMU_DATA_CHANNEL.clear();
+        // Get the acceleration reading from sensor
+        match adxl345.get_accel().await {
+            Ok(data) => {
+                let data = ImuData {
+                    acceleration: [data.0, data.1, data.2],
+                    gyro: [0.0, 0.0, 0.0],
+                    mag: [0.0, 0.0, 0.0],
+                    time_stamp: time_stamp,
+                };
 
-                            // if queue is empty wait until we can send until timeout
-                            IMU_DATA_CHANNEL.send(data).with_timeout(Duration::from_millis(IMU_SEND_TIMEOUT_MILLIS)).await.ok(); 
-                        }
-                    };
-                },
+                // try sending data, if channel is full, flush it and send again
+                match IMU_DATA_CHANNEL.try_send(data) {
+                    Ok(_) => {
+                        info!("sent imu data: a: ({}, {}, {}), g: ({}, {}, {}), m: ({}, {}, {}), ts: {}", 
+                            data.acceleration[0], data.acceleration[1], data.acceleration[2],
+                            data.gyro[0], data.gyro[1], data.gyro[2],
+                            data.mag[0], data.mag[1], data.mag[2],
+                            data.time_stamp);
+                    }
+                    Err(_) => {
+                        warn!("imu data channel full, flushing data");
+                        // IMU_DATA_CHANNEL.clear();
 
-                Err(e) => {
-                    error!("ADXL345 Read Error: {}", Debug2Format(&e));
-                }
+                        // if queue is empty wait until we can send until timeout
+                        IMU_DATA_CHANNEL.send(data).with_timeout(Duration::from_millis(IMU_SEND_TIMEOUT_MILLIS)).await.ok(); 
+                    }
+                };
+            },
+
+            Err(e) => {
+                error!("ADXL345 Read Error: {}", Debug2Format(&e));
             }
         }
+        
         // no need for perfectly timed data, simple delay is fine
         Timer::after(Duration::from_millis(IMU_MILLIS_DELAY)).await;
     }
@@ -414,6 +423,7 @@ async fn log_baro_task(volume_mgr: &'static VolumeManagerType) {
     }
 }
 
+// Logs data from the IMU Data Channel to the SD Card
 #[task]
 async fn log_imu_task(volume_mgr: &'static VolumeManagerType) {
     info!("Entered IMU Logging Task");
@@ -469,6 +479,7 @@ async fn log_imu_task(volume_mgr: &'static VolumeManagerType) {
 
 }
 
+// Writes a string to a file from the SD Card assuming the file is already open
 async fn write_to_file(file: &'static FileType, buf: &str) {
     let start_timestamp: u32 = Instant::now().as_micros() as u32;
     loop {
@@ -492,6 +503,7 @@ async fn write_to_file(file: &'static FileType, buf: &str) {
 
 }
 
+// Writes a string to a file from the SD Card with full opening and closing of the volume, directory, and file for the write operation
 async fn write_to_sd_card(volume_mgr: &  VolumeManagerType, buf: &str, filename: &str) {
     info!("{} trying to open volume", filename);
     let volume_future = volume_mgr.open_volume(VolumeIdx(0)).await;
@@ -528,7 +540,8 @@ async fn write_to_sd_card(volume_mgr: &  VolumeManagerType, buf: &str, filename:
 
     
 }
-                
+
+// Writes a byte array to a file from the SD Card with full opening and closing of the volume, directory, and file for the write operation
 async fn write_to_sd_card_buffer(volume_mgr: & VolumeManagerType, buf: &[u8], filename: &str) {
 let volume_future = volume_mgr.open_volume(VolumeIdx(0)).await;
 
