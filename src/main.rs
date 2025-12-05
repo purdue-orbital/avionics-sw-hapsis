@@ -1,7 +1,7 @@
 #![no_std]
 #![no_main]
 
-use core::{cell::RefCell};
+use core::{cell::RefCell, error, fmt::Debug};
 
 use defmt::*;
 use embassy_executor::{Spawner, task};
@@ -13,6 +13,7 @@ use embassy_sync::{
     blocking_mutex::raw::{CriticalSectionRawMutex, ThreadModeRawMutex}, channel::Channel, mutex::{Mutex}
 };
 use avionics_sw_hapsis::*;
+use futures_util::task::SpawnError;
 use static_cell::StaticCell;
 use {defmt_rtt as _, panic_probe as _};
 
@@ -148,7 +149,12 @@ async fn main(_spawner: Spawner) {
    
     let led = Output::new(p.PB7, Level::High, Speed::Low);
 
-    _spawner.spawn(control_task(led)).unwrap();
+    match _spawner.spawn(control_task(led)) {
+        Ok(_) => {},
+        Err(e) => {
+            error!("Couldn't start Control Task. {}\n ", Debug2Format(&e));
+        }
+    };
 
     let spi_dev =  embassy_embedded_hal::shared_bus::asynch::spi::SpiDeviceWithConfig::new(spi_mutex_guard, spi_cs, spi_config);
 
@@ -158,8 +164,18 @@ async fn main(_spawner: Spawner) {
     let sd_card = SdCard::new_with_options(spi_dev, Delay, sd_card_options);
 
     // Start the Baro and IMU task for initialization
-    _spawner.spawn(baro_task(i2c_bus)).unwrap();
-    _spawner.spawn(imu_task(i2c_bus)).unwrap();
+    match _spawner.spawn(baro_task(i2c_bus)) {
+        Ok(_) => {},
+        Err(e) => {
+            error!("Couldn't start the barometer task. {}", Debug2Format(&e));
+        },
+    }
+    match _spawner.spawn(imu_task(i2c_bus)) {
+        Ok(_) => {},
+        Err(e) => {
+            error!("Couldn't start the imu task. {}", Debug2Format(&e));
+        },
+    };
 
     info!("Init SD card controller and retrieve card size...");
     loop {
@@ -179,7 +195,7 @@ async fn main(_spawner: Spawner) {
                 
             },
             Err(e) => {
-                error!("Tmeout SD Card Error: {:?}", defmt::Debug2Format(&e));
+                error!("Timeout SD Card Error: {:?}", defmt::Debug2Format(&e));
             }
         }
     }
@@ -189,10 +205,18 @@ async fn main(_spawner: Spawner) {
     let long_live_volume_manager = VOLUME_MANAGER.init(volume_mgr);
 
     // Create the logging tasks after the SD Card has been initialized
-    _spawner.spawn(log_baro_task(long_live_volume_manager)).unwrap();
-    _spawner.spawn(log_imu_task(long_live_volume_manager)).unwrap();
-
-
+    match _spawner.spawn(log_baro_task(long_live_volume_manager)) {
+        Ok(_) => {},
+        Err(e) => {
+            error!("Couldn't spawn logging baro task! {}", Debug2Format(&e));
+        },
+    }
+    match _spawner.spawn(log_imu_task(long_live_volume_manager)) {
+        Ok(_) => {},
+        Err(e) => {
+            error!("Couldn't spawn logging imu task! {}", Debug2Format(&e));
+        },
+    }
 
     info!("Setup Complete");
 }
@@ -228,7 +252,9 @@ async fn baro_task(i2c_mutex_bus: &'static I2cMutexType) {
 
     // Initialize BME280 I2C Driver forever with a timeout after each error, so other parts of the program can continue
     // Initialize I2C Bus
+    
     let bme_i2c_dev = embassy_embedded_hal::shared_bus::asynch::i2c::I2cDevice::new(i2c_mutex_bus);
+    
 
     info!("Initializing BME 280");
     let mut bme280_dev = AsyncBME280::new(bme_i2c_dev, BME_I2C_ADDR);
@@ -315,7 +341,16 @@ async fn imu_task(i2c_bus: &'static I2cMutexType) {
     let adxl_i2c = embassy_embedded_hal::shared_bus::asynch::i2c::I2cDevice::new(i2c_bus);
 
     // 0x1D is the alt address depending on grounding of SDO or not in my case it is grounded
-    let mut adxl345 = Adxl345Driver::new(adxl_i2c, Some(ADXL_I2C_ADDR)).await.unwrap();
+    let mut adxl345 = match Adxl345Driver::new(adxl_i2c, Some(ADXL_I2C_ADDR)).await {
+        Ok(adxl_driver) => {
+            adxl_driver
+        },
+        Err(e) => {
+            error!("Couldn't instantiate ADXL Driver! {}", Debug2Format(&e));
+            return;
+        },
+    }; 
+
     loop {
         info!("Initializing ADXL345");
         match adxl345.init().with_timeout(Duration::from_millis(ADXL345_INIT_TIMEOUT_MILLIS)).await {
@@ -480,76 +515,104 @@ async fn log_imu_task(volume_mgr: &'static VolumeManagerType) {
 }
 
 // Writes a string to a file from the SD Card assuming the file is already open
-async fn write_to_file(file: &'static FileType, buf: &str) {
-    let start_timestamp: u32 = Instant::now().as_micros() as u32;
-    loop {
-        match file.write(buf.as_bytes()).await {
-                    Ok(_) => {
-                        let end_timestamp: u32 = Instant::now().as_micros() as u32;
-                        info!("Diff: {}", end_timestamp - start_timestamp);
-                        file.flush().await.unwrap();
-                        info!("Flushed to File!");
-                        break;
-                    },
+// async fn write_to_file(file: &'static FileType, buf: &str) {
+//     let start_timestamp: u32 = Instant::now().as_micros() as u32;
+//     loop {
+//         match file.write(buf.as_bytes()).await {
+//                     Ok(_) => {
+//                         let end_timestamp: u32 = Instant::now().as_micros() as u32;
+//                         info!("Diff: {}", end_timestamp - start_timestamp);
+//                         file.flush().await.unwrap();
+//                         info!("Flushed to File!");
+//                         break;
+//                     },
                     
-                    Err(e) => {
-                        let end_timestamp: u32 = Instant::now().as_micros() as u32;
-                        error!("Diff: {}", end_timestamp - start_timestamp);
-                        error!("{}", defmt::Debug2Format(&e));
-                        Timer::after(Duration::from_micros(1_000_000)).await;
-                    }
-        }
-    }
+//                     Err(e) => {
+//                         let end_timestamp: u32 = Instant::now().as_micros() as u32;
+//                         error!("Diff: {}", end_timestamp - start_timestamp);
+//                         error!("{}", defmt::Debug2Format(&e));
+//                         Timer::after(Duration::from_micros(1_000_000)).await;
+//                     }
+//         }
+//     }
 
-}
+// }
 
 // Writes a string to a file from the SD Card with full opening and closing of the volume, directory, and file for the write operation
-async fn write_to_sd_card(volume_mgr: &  VolumeManagerType, buf: &str, filename: &str) {
-    info!("{} trying to open volume", filename);
+// async fn write_to_sd_card(volume_mgr: &  VolumeManagerType, buf: &str, filename: &str) {
+//     info!("{} trying to open volume", filename);
+//     let volume_future = volume_mgr.open_volume(VolumeIdx(0)).await;
+
+//     match volume_future {
+//         Ok(volume) => {
+//             let root_dir = volume.open_root_dir().await.unwrap();
+//             info!("\nCreating or Appending file {}...", filename);
+//             let f = root_dir.open_file_in_dir(filename, Mode::ReadWriteCreateOrAppend).await.unwrap();
+//             let start_timestamp: u32 = Instant::now().as_micros() as u32;
+//             match f.write(buf.as_bytes()).await {
+//                 Ok(_) => {
+//                     let end_timestamp: u32 = Instant::now().as_micros() as u32;
+//                     info!("Diff: {}", end_timestamp - start_timestamp);
+//                 },
+
+//                 Err(e) => {
+//                     let end_timestamp: u32 = Instant::now().as_micros() as u32;
+//                     error!("Diff: {}", end_timestamp - start_timestamp);
+//                     error!("{}", defmt::Debug2Format(&e));
+//                 }
+//             }
+            
+//             f.close().await.unwrap();
+//             root_dir.close().await.unwrap();
+//             volume.close().await.unwrap();
+//             info!("{} closed volume", filename);
+//         },
+
+//         Err(e) => {
+//             error!("{}", defmt::Debug2Format(&e));
+//         }
+//     }
+
+    
+// }
+
+// Writes a byte array to a file from the SD Card with full opening and closing of the volume, directory, and file for the write operation
+async fn write_to_sd_card_buffer(volume_mgr: & VolumeManagerType, buf: &[u8], filename: &str) {
     let volume_future = volume_mgr.open_volume(VolumeIdx(0)).await;
 
     match volume_future {
         Ok(volume) => {
-            let root_dir = volume.open_root_dir().await.unwrap();
-            info!("\nCreating or Appending file {}...", filename);
-            let f = root_dir.open_file_in_dir(filename, Mode::ReadWriteCreateOrAppend).await.unwrap();
-            let start_timestamp: u32 = Instant::now().as_micros() as u32;
-            match f.write(buf.as_bytes()).await {
-                Ok(_) => {
-                    let end_timestamp: u32 = Instant::now().as_micros() as u32;
-                    info!("Diff: {}", end_timestamp - start_timestamp);
+
+            let root_dir = match volume.open_root_dir().await {
+                Ok(dir) => {
+                    dir
                 },
-
                 Err(e) => {
-                    let end_timestamp: u32 = Instant::now().as_micros() as u32;
-                    error!("Diff: {}", end_timestamp - start_timestamp);
-                    error!("{}", defmt::Debug2Format(&e));
-                }
-            }
-            
-            f.close().await.unwrap();
-            root_dir.close().await.unwrap();
-            volume.close().await.unwrap();
-            info!("{} closed volume", filename);
-        },
+                    error!("Could not open root directory! {}", Debug2Format(&e));
+                    match volume.close().await {
+                        Ok(_) => {
 
-        Err(e) => {
-            error!("{}", defmt::Debug2Format(&e));
-        }
-    }
+                        },
+                        Err(e) => {
+                            error!("Error Closing Volume: {}", Debug2Format(&e));
+                        },
+                    };
+                    return;
+                },
+            };
 
-    
-}
-
-// Writes a byte array to a file from the SD Card with full opening and closing of the volume, directory, and file for the write operation
-async fn write_to_sd_card_buffer(volume_mgr: & VolumeManagerType, buf: &[u8], filename: &str) {
-let volume_future = volume_mgr.open_volume(VolumeIdx(0)).await;
-
-    match volume_future {
-        Ok(volume) => {
-            let root_dir = volume.open_root_dir().await.unwrap();
             info!("\nCreating or Appending file {}...", filename);
-            let f = root_dir.open_file_in_dir(filename, Mode::ReadWriteCreateOrAppend).await.unwrap();
+            
+            let f = match root_dir.open_file_in_dir(filename, Mode::ReadWriteCreateOrAppend).await {
+                Ok(file) => {
+                    file
+                },
+                Err(e) => {
+                    error!("Cannot open file in root directory {}", Debug2Format(&e));
+                    return;
+                },
+            };
+
             let start_timestamp: u32 = Instant::now().as_micros() as u32;
             match f.write(buf).await {
                 Ok(_) => {
@@ -570,7 +633,7 @@ let volume_future = volume_mgr.open_volume(VolumeIdx(0)).await;
         },
 
         Err(e) => {
-            error!("{}", defmt::Debug2Format(&e));
+            error!("Couldn't open volume! {}", defmt::Debug2Format(&e));
         }
     }
 }
